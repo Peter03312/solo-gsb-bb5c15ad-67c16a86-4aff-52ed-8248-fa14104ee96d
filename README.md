@@ -6,7 +6,9 @@ Python 3.11 + FastAPI + SQLite 实现。维护各供水分区的**必测指标**
 **恰有一条**生效限值时方可发布，**任一超限即不合格**。发布保存读数、限值依据与
 结论快照；同一读数版本不得重复发布，更正后再发布产生**新版本报告**且旧版保留可查；
 发布事务化，并发发布只准一个成功、失败不留部分报告；并可按分区与采样时间范围
-（左闭右开、仅取每个样本最新已发布报告）查询合格/不合格与按指标的超限汇总。
+（左闭右开、仅取每个样本最新已发布报告）查询合格/不合格与按指标的超限汇总；
+质控人员调整限值前，还可对**拟议限值**按时间窗口做只读的影响预览（重判冻结报告，
+不读当前读数、不改限值与历史报告）。
 
 ---
 
@@ -121,6 +123,7 @@ Compose 中通过 `ports: "8080:8080"` 映射宿主机端口；改为如 `"18080
 | GET | `/samples/{sample}/reports` | 报告版本列表 |
 | GET | `/samples/{sample}/reports/{report_id}` | 报告快照（读数+限值依据+结论） |
 | GET | `/partitions/{partition}/compliance-summary` | **按分区 + 采样时间窗口汇总**，见下 |
+| POST | `/partitions/{partition}/limit-change-preview` | **限值调整影响预览（只读模拟）**，见下 |
 
 读数请求体：
 
@@ -229,17 +232,104 @@ curl -sS --get "http://localhost:8080/partitions/P1/compliance-summary" \
 }
 ```
 
+### 限值调整影响预览（按分区 + 采样时间窗口，只读模拟）
+
+`POST /partitions/{partition}/limit-change-preview`
+
+质控人员**正式调整限值前**，用拟议限值对窗口内已发布报告做"如果这样改，结论会怎样"
+的影响预览。接口为纯只读模拟：**不读取样本当前读数、不改动任何限值、不改动历史报告**。
+
+请求体：
+
+```json
+{
+  "indicator_code": "turbidity",
+  "start_at": "2025-01-01T00:00:00Z",
+  "end_at": "2026-01-01T00:00:00Z",
+  "min_value": null,
+  "max_value": 1.5
+}
+```
+
+- `start_at` / `end_at` **必须带时区**，服务端归一化为 UTC；窗口按样本 `sampled_at`
+  **左闭右开** `[start_at, end_at)` 筛选（与合规汇总一致）；`start_at >= end_at` ->
+  `422 invalid_time_range`。
+- `min_value` / `max_value` 为**拟议**上下限，非负有限；至少给一个，双界时必须
+  `min < max`，否则 `422 invalid_limit`（负数/NaN/无穷 -> `422 validation_error`）。
+  判定语义同发布：下限包含、上限不包含，即 `min <= value < max`。
+- 分区不存在 -> `404 partition_not_found`；指标不存在 -> `404 indicator_not_found`；
+  指标存在但**非该分区必测项** -> `422 not_mandatory_indicator`。
+- 窗口内**每个样本只取其最新一条已发布报告**的冻结快照（读数与原结论均来自该快照，
+  不查当前读数）；未发布样本不计入；窗口内无已发布样本时所有计数为 0、列表为空。
+- 快照**不含目标指标**（如该指标是报告发布后才成为必测项的旧版报告）-> 该样本列入
+  `unevaluable_samples`（给样本标识与原因），**不参与前后合格数**。
+- 对可评估报告：用拟议限值**仅重判目标指标**，报告中其他指标沿用快照里的原判定，
+  合并形成模拟结论（任一项违规仍为不合格）。
+
+返回字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `total_reported_samples` | 窗口内有已发布报告的样本总数（含不可评估） |
+| `evaluable_sample_count` | 可评估样本数（快照含目标指标） |
+| `unevaluable_samples` | 不可评估样本列表：`sample_id`/`report_id`/`reading_version`/`sampled_at`/`reason` |
+| `original_qualified_count` / `original_unqualified_count` | 原结论合格/不合格数（仅可评估样本） |
+| `simulated_qualified_count` / `simulated_unqualified_count` | 拟议限值下的模拟合格/不合格数（仅可评估样本） |
+| `changed_samples` | **结论发生变化**的样本：样本标识、目标指标冻结读数、前后结论、目标指标重判前后是否在范围、拟议违规原因与其他指标原有违规 |
+| `proposed_limits` | 回显拟议 `min_value` / `max_value`（省略的界限为 `null`） |
+
+```bash
+curl -sS -X POST "http://localhost:8080/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","min_value":null,"max_value":1.5,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}'
+```
+
+```json
+{
+  "partition_code": "P1",
+  "indicator_code": "turbidity",
+  "start_at": "2025-01-01T00:00:00Z",
+  "end_at": "2026-01-01T00:00:00Z",
+  "proposed_limits": {"min_value": null, "max_value": 1.5},
+  "total_reported_samples": 2,
+  "evaluable_sample_count": 2,
+  "unevaluable_samples": [],
+  "original_qualified_count": 1,
+  "original_unqualified_count": 1,
+  "simulated_qualified_count": 2,
+  "simulated_unqualified_count": 0,
+  "changed_samples": [
+    {
+      "sample_id": "42e5fba1-8569-403d-a277-8b060ef53c6e",
+      "sampled_at": "2025-06-01T00:00:00Z",
+      "report_id": 3,
+      "reading_version": 3,
+      "indicator_code": "turbidity",
+      "frozen_value": 1.0,
+      "original_conclusion": "unqualified",
+      "simulated_conclusion": "qualified",
+      "original_target_in_range": false,
+      "simulated_target_in_range": true,
+      "proposed_violations": [],
+      "other_indicator_violations": []
+    }
+  ]
+}
+```
+
 ## 5. 调用示例
 
 服务启动后任选其一：
 
 ```bash
 # curl 版（仅依赖 bash/curl/python3 解析 JSON），覆盖全部正常与拒绝路径；
-# 末尾第 11 步演示合规汇总（窗口查询/时区参数/零基线/非法区间/分区不存在）
+# 第 11 步演示合规汇总；第 12 步演示限值调整影响预览（放宽/收紧、仅下限、
+# 空窗口、非法限值/时间、分区/指标不存在、指标非必测）
 bash examples/api_examples.sh
 
 # Python 版（仅标准库，自带断言，无需安装第三方包）；
-# 末尾演示合规汇总的正常路径、仅最新报告计入与三类错误
+# 末尾演示合规汇总与限值调整影响预览的正常路径、仅最新报告计入与各类错误
 python examples/demo_client.py
 
 # 指定地址
@@ -253,11 +343,15 @@ pip install pytest httpx
 pytest -q
 ```
 
-28 个用例覆盖：区间重叠/相接/非法区间、必测成员约束、非负校验、版本冲突、
+37 个用例覆盖：区间重叠/相接/非法区间、必测成员约束、非负校验、版本冲突、
 更正请求号缺失/重放/同号异内容、读数不齐、无生效限值、左闭右开边界、
 min 闭/max 开判定、重复发布、更正后新旧版本并存、5 线程并发发布仅一个成功、
 发布失败不留报告；以及合规汇总的零基线、仅最新报告计入、未发布排除、
-左闭右开窗口与时区归一、分区间隔离、按指标超限计数、非法区间/缺分区错误。
+左闭右开窗口与时区归一、分区间隔离、按指标超限计数、非法区间/缺分区错误；
+以及限值调整预览的空窗口零计数、放宽/收紧（max 开端/min 闭端）、
+其他指标原违规阻断翻转、报告不含目标指标的不可评估、仅用最新报告冻结读数
+（发布后再次更正当前读数不影响预览）、窗口边界与时区、只读不改动，
+以及非法限值/时间、分区或指标不存在、指标非必测等全部拒绝路径。
 
 ## 7. 项目结构
 
@@ -274,6 +368,7 @@ app/
   routers/admin.py     # 主数据管理接口
   routers/samples.py   # 样本/读数/发布接口
   routers/summaries.py # 合规汇总查询接口（分区 + 采样时间窗口）
+  routers/preview.py   # 限值调整影响预览接口（只读模拟重判冻结快照）
 scripts/init_db.py     # 手工初始化脚本
 examples/              # curl 与 Python 调用示例
 tests/                 # pytest 端到端用例
@@ -298,3 +393,8 @@ requirements.txt
   再按 `sampled_at_ms >= start AND sampled_at_ms < end` 左闭右开过滤，
   快照 `violations` 在应用层聚合按指标计数；汇总走只读事务快照，
   未发布样本（reports 中无行）自然被 JOIN 排除。
+- **限值调整预览**：复用"每样本最新报告 + 左闭右开窗口"取数，但直接解析报告
+  `snapshot_json` 冻结快照（不 JOIN 当前 readings 表），在应用层用拟议限值
+  重判目标指标、其余指标沿用快照 `violations` 原判定合成结论；全程只读事务，
+  限值表、reports 与读数均不被触碰。快照缺目标指标项的旧报告归为不可评估，
+  排除在前后合格数分母之外。

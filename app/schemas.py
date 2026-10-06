@@ -102,3 +102,41 @@ class ReadingUpsert(StrictModel):
 
 class PublishIn(StrictModel):
     expected_version: int = Field(ge=0)
+
+
+class LimitPreviewIn(StrictModel):
+    """限值调整影响预览（只读模拟）请求体。
+
+    - 时间窗口左闭右开 [start_at, end_at)，端点必须带时区。
+    - min_value/max_value 为拟议限值，非负有限；至少给一个，双界时 min < max
+      （下限包含、上限不包含，与发布判定 min <= value < max 一致）。
+    """
+
+    indicator_code: str = _NON_EMPTY
+    start_at: datetime
+    end_at: datetime
+    min_value: float | None = Field(default=None)
+    max_value: float | None = Field(default=None)
+
+    @field_validator("min_value", "max_value")
+    @classmethod
+    def _finite_nonnegative(cls, v: float | None) -> float | None:
+        if v is None:
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("must be a finite number")
+        if v < 0:
+            raise ValueError("limit value must be non-negative")
+        return v
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return to_utc(v)
+
+    def validate_bounds(self) -> None:
+        if self.min_value is None and self.max_value is None:
+            raise ValueError("at least one of min_value/max_value is required")
+        if self.min_value is not None and self.max_value is not None:
+            if self.min_value >= self.max_value:
+                raise ValueError("min_value must be strictly less than max_value")

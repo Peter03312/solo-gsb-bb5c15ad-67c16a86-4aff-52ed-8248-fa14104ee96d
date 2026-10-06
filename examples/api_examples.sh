@@ -151,5 +151,80 @@ curl -sS -w '\nHTTP %{http_code}\n' --get "$BASE/partitions/NOPE/compliance-summ
   --data-urlencode "start_at=2025-01-01T00:00:00Z" \
   --data-urlencode "end_at=2026-01-01T00:00:00Z"
 
+say "12. 限值调整影响预览：放宽浑浊度上限 1.0 -> 1.5（纯只读模拟，不改限值/报告）"
+echo "  先登记一份浑浊度冻结值 1.0 的不合格报告（max 开端，等于上限即超限）"
+EDGE=$(curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' \
+  -d "{\"partition_code\":\"P1\",\"sampled_at\":\"$SAMPLED_AT_UTC\"}" | jqget "['id']")
+curl -sS -X PUT "$BASE/samples/$EDGE/readings/turbidity" -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","value":1.0,"expected_version":0}' >/dev/null
+curl -sS -X PUT "$BASE/samples/$EDGE/readings/ph" -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"ph","value":7.2,"expected_version":1}' >/dev/null
+curl -sS -X PUT "$BASE/samples/$EDGE/readings/residual_chlorine" -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"residual_chlorine","value":0.8,"expected_version":2}' >/dev/null
+curl -sS -X POST "$BASE/samples/$EDGE/publish" -H 'Content-Type: application/json' \
+  -d '{"expected_version":3}' >/dev/null
+echo "  预览窗口 2025 全年：样本 $EDGE 的浑浊度应由不合格模拟为合格"
+curl -sS -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","min_value":null,"max_value":1.5,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}' \
+  | python3 -m json.tool
+
+say "12b. 收紧上限到 0.1（同一样本模拟仍不合格）"
+curl -sS -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","max_value":0.1,
+       "start_at":"2025-01-01T08:00:00+08:00","end_at":"2026-01-01T08:00:00+08:00"}' \
+  | python3 -m json.tool
+
+say "12c. 仅给拟议下限（max 省略）：游离余氯下限 0.05（含）"
+curl -sS -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"residual_chlorine","min_value":0.05,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}' \
+  | python3 -m json.tool
+
+say "12d. 无已发布样本的窗口：零计数 + 空列表"
+curl -sS -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","max_value":1.0,
+       "start_at":"2024-01-01T00:00:00Z","end_at":"2025-01-01T00:00:00Z"}' \
+  | python3 -m json.tool
+
+say "12e. 拒绝：上下限都不给 / min>=max（422 invalid_limit）"
+curl -sS -o /tmp/lp1.json -w 'HTTP %{http_code}\n' -X POST \
+  "$BASE/partitions/P1/limit-change-preview" -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity",
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}'
+cat /tmp/lp1.json | python3 -m json.tool
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","min_value":1.5,"max_value":1.5,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}'
+
+say "12f. 拒绝：时间不带时区 / 起点不早于终点（422）"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","max_value":1.0,
+       "start_at":"2025-01-01T08:00:00","end_at":"2026-01-01T00:00:00Z"}'
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","max_value":1.0,
+       "start_at":"2026-01-01T00:00:00Z","end_at":"2025-01-01T00:00:00Z"}'
+
+say "12g. 拒绝：分区不存在 / 指标不存在 / 非该分区必测项"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/NOPE/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity","max_value":1.0,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}'
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"nope-indicator","max_value":1.0,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}'
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"conductivity","max_value":300.0,
+       "start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z"}'
+
 echo
 echo "DONE. 可交互式查看 OpenAPI 文档： $BASE/docs"

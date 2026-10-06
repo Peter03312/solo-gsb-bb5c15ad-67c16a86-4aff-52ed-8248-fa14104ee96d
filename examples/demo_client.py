@@ -289,6 +289,87 @@ def main() -> None:
     expect(404, s, "partition missing")
     print("  code:", r["error"]["code"])
 
+    # -------------------------------------------------- 限值调整影响预览
+    # 复用本分区窗口 [anchor, anchor+1h)：sid_bad 最新报告 ph 已更正为合格，
+    # 但早先造数样本中无浑浊度超限；再造 1 份浑浊度 1.0（max 开端）的不合格报告
+    step("预览准备：窗口内新增 1 份浑浊度冻结值 1.0 的不合格报告")
+    sid_edge = register_publish(15, {"turbidity": 1.0, "ph": 7.2, "residual_chlorine": 0.8})
+
+    def preview(indicator, **bounds):
+        return call("POST", f"/partitions/{pcode}/limit-change-preview",
+                    {"indicator_code": indicator, "start_at": iso(win_from),
+                     "end_at": iso(win_to), **bounds})
+
+    step("预览：浑浊度上限放宽到 1.5 -> 1.0 由不合格模拟为合格（纯只读）")
+    s, pv = preview("turbidity", min_value=None, max_value=1.5)
+    expect(200, s, "preview loosen")
+    print(" ", json.dumps(pv, ensure_ascii=False))
+    assert pv["total_reported_samples"] == 3
+    assert pv["evaluable_sample_count"] == 3
+    assert pv["original_qualified_count"] == 2
+    assert pv["simulated_qualified_count"] == 3
+    assert [c["sample_id"] for c in pv["changed_samples"]] == [sid_edge]
+    ch = pv["changed_samples"][0]
+    assert ch["original_conclusion"] == "unqualified"
+    assert ch["simulated_conclusion"] == "qualified"
+    assert ch["frozen_value"] == 1.0 and ch["simulated_target_in_range"] is True
+
+    step("预览：收紧到 0.1（max 开端）与仅设下限 0.05")
+    s, pv = preview("turbidity", max_value=0.1)
+    expect(200, s, "preview tighten")
+    assert pv["simulated_qualified_count"] == 0
+    s, pv = preview("residual_chlorine", min_value=0.05, max_value=None)
+    expect(200, s, "preview min only")
+    assert pv["proposed_limits"] == {"min_value": 0.05, "max_value": None}
+    print("  min-only proposed_limits:", pv["proposed_limits"])
+
+    step("预览：无报告窗口 -> 零计数与空列表")
+    s, pv = call("POST", f"/partitions/{pcode}/limit-change-preview",
+                 {"indicator_code": "turbidity", "max_value": 1.0,
+                  "start_at": "2024-01-01T00:00:00Z", "end_at": "2024-02-01T00:00:00Z"})
+    expect(200, s, "preview empty")
+    assert pv["evaluable_sample_count"] == 0
+    assert pv["unevaluable_samples"] == [] and pv["changed_samples"] == []
+    print(" ", {k: pv[k] for k in ("total_reported_samples", "evaluable_sample_count",
+                                   "original_qualified_count", "simulated_qualified_count")})
+
+    step("预览拒绝：双界皆空 / min>=max -> 422 invalid_limit")
+    s, r = preview("turbidity")
+    expect(422, s, "no bounds")
+    print("  code:", r["error"]["code"])
+    s, r = preview("turbidity", min_value=2.0, max_value=1.0)
+    expect(422, s, "min >= max")
+    print("  code:", r["error"]["code"])
+
+    step("预览拒绝：时间不带时区 / 起点不早于终点 -> 422")
+    s, r = call("POST", f"/partitions/{pcode}/limit-change-preview",
+                {"indicator_code": "turbidity", "max_value": 1.0,
+                 "start_at": "2025-06-01T08:00:00", "end_at": iso(win_to)})
+    expect(422, s, "naive datetime")
+    print("  code:", r["error"]["code"])
+    s, r = preview("turbidity", max_value=1.0,
+                   **{"start_at": iso(win_to), "end_at": iso(win_from)})
+    expect(422, s, "invalid range")
+    print("  code:", r["error"]["code"])
+
+    step("预览拒绝：分区/指标不存在、指标非必测 -> 404 / 404 / 422")
+    s, r = call("POST", "/partitions/NOPE/limit-change-preview",
+                {"indicator_code": "turbidity", "max_value": 1.0,
+                 "start_at": iso(win_from), "end_at": iso(win_to)})
+    expect(404, s, "partition missing")
+    print("  code:", r["error"]["code"])
+    s, r = preview("nope-indicator", max_value=1.0)
+    expect(404, s, "indicator missing")
+    print("  code:", r["error"]["code"])
+    # 新建一个指标但不加入本分区必测项 -> “指标存在但非该分区必测”
+    ind_code = f"preview_ind_{RUN_TAG[-8:]}"
+    s, _ = call("POST", "/admin/indicators",
+                {"code": ind_code, "name": "预览专用指标", "unit": "-"})
+    assert s == 201, s
+    s, r = preview(ind_code, max_value=1.0)
+    expect(422, s, "not mandatory")
+    print("  code:", r["error"]["code"])
+
     print("\nALL DEMO STEPS PASSED")
 
 
