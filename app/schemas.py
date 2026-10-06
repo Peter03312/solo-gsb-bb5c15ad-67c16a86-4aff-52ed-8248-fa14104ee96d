@@ -102,3 +102,35 @@ class ReadingUpsert(StrictModel):
 
 class PublishIn(StrictModel):
     expected_version: int = Field(ge=0)
+
+
+class LimitChangePreviewIn(StrictModel):
+    """限值调整影响预览请求：分区在路径上给出，请求体携带目标指标、采样窗口与拟议限值。
+
+    - start_at/end_at 必须带时区，归一化 UTC；start_at >= end_at 在业务层拒绝。
+    - min_value/max_value 为拟议非负上下限，可省略其一但至少给一个；
+      双界时要求 min_value < max_value（下限包含、上限不包含）。
+    - 预览只读，不改动任何限值、报告或当前读数。
+    """
+
+    indicator_code: str = _NON_EMPTY
+    start_at: datetime
+    end_at: datetime
+    min_value: float | None = Field(default=None)
+    max_value: float | None = Field(default=None)
+
+    @field_validator("min_value", "max_value")
+    @classmethod
+    def _finite_nonnegative(cls, v: float | None) -> float | None:
+        if v is None:
+            return None
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("must be a finite number")
+        if v < 0:
+            raise ValueError("limit value must be non-negative")
+        return v
+
+    @field_validator("start_at", "end_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        return to_utc(v)

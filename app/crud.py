@@ -618,3 +618,165 @@ def compliance_summary(
         "unqualified_count": total - qualified,
         "indicator_violations": dict(sorted(violations_by_indicator.items())),
     }
+
+
+# ---------------------------------------------------------------- 限值调整影响预览
+
+def preview_limit_change(
+    partition_code: str,
+    indicator_code: str,
+    start_at: datetime,
+    end_at: datetime,
+    min_value: float | None,
+    max_value: float | None,
+) -> dict[str, Any]:
+    """按采样时间窗口预览调整某指标限值对已发布报告结论的影响（只读模拟）。
+
+    规则：
+    - 窗口左闭右开 [start_at, end_at)，时间必须带时区；start_at >= end_at -> 422。
+    - 分区不存在 -> 404；指标不存在 -> 404 indicator_not_found；
+      指标非该分区必测项 -> 422 not_mandatory_indicator。
+    - 限值至少给一个界，均须非负有限；双界时 min < max -> 否则 422 invalid_limit。
+    - 窗口内每个样本只取其最新已发布报告的冻结快照（不读取当前读数、不碰限值/报告）。
+    - 快照未含目标指标项 -> 不可评估（not_evaluable），不参与前后合格计数。
+    - 可评估报告：目标指标用拟议限值重判（min 闭、max 开），其他指标沿用原快照判定，
+      合成模拟结论；任一违规即不合格。
+    """
+    if start_at.tzinfo is None or end_at.tzinfo is None:
+        raise UnprocessableError(
+            "start_at and end_at must be timezone-aware, e.g. 2025-06-01T08:00:00+08:00",
+            code="invalid_time_range",
+        )
+
+    start_utc = timeutil.to_utc(start_at)
+    end_utc = timeutil.to_utc(end_at)
+    if start_utc >= end_utc:
+        raise UnprocessableError(
+            "start_at must be strictly earlier than end_at (half-open [start_at, end_at))",
+            code="invalid_time_range",
+            details={"start_at": timeutil.iso_z(start_utc), "end_at": timeutil.iso_z(end_utc)},
+        )
+
+    if min_value is None and max_value is None:
+        raise UnprocessableError(
+            "at least one of min_value/max_value is required", code="invalid_limit"
+        )
+    if min_value is not None and max_value is not None and min_value >= max_value:
+        raise UnprocessableError(
+            "min_value must be strictly less than max_value (lower bound inclusive, "
+            "upper bound exclusive)",
+            code="invalid_limit",
+            details={"min_value": min_value, "max_value": max_value},
+        )
+
+    start_ms, end_ms = timeutil.epoch_ms(start_utc), timeutil.epoch_ms(end_utc)
+
+    with read_tx() as conn:
+        if not conn.execute("SELECT 1 FROM partitions WHERE code=?", (partition_code,)).fetchone():
+            raise NotFoundError(
+                f"partition {partition_code!r} not found", code="partition_not_found"
+            )
+        if not conn.execute("SELECT 1 FROM indicators WHERE code=?", (indicator_code,)).fetchone():
+            raise NotFoundError(
+                f"indicator {indicator_code!r} not found", code="indicator_not_found"
+            )
+        membership = conn.execute(
+            "SELECT 1 FROM mandatory_indicators WHERE partition_code=? AND indicator_code=?",
+            (partition_code, indicator_code),
+        ).fetchone()
+        if not membership:
+            raise UnprocessableError(
+                f"indicator {indicator_code!r} is not a mandatory indicator of partition "
+                f"{partition_code!r}",
+                code="not_mandatory_indicator",
+            )
+
+        # 仅取窗口内每个样本最新（reading_version 最大）已发布报告的冻结快照。
+        rows = conn.execute(
+            """
+            SELECT s.id AS sample_id, s.sampled_at AS sampled_at,
+                   s.sampled_at_ms AS sampled_at_ms, r.id AS report_id,
+                   r.snapshot_json AS snapshot_json
+            FROM samples s
+            JOIN reports r ON r.sample_id = s.id
+            WHERE s.partition_code = ?
+              AND s.sampled_at_ms >= ? AND s.sampled_at_ms < ?
+              AND r.reading_version = (
+                  SELECT MAX(r2.reading_version) FROM reports r2 WHERE r2.sample_id = s.id
+              )
+            ORDER BY s.sampled_at_ms, s.id
+            """,
+            (partition_code, start_ms, end_ms),
+        ).fetchall()
+
+    evaluable = 0
+    original_qualified = 0
+    simulated_qualified = 0
+    not_evaluable: list[dict[str, Any]] = []
+    changed_samples: list[dict[str, Any]] = []
+
+    for row in rows:
+        snapshot = json.loads(row["snapshot_json"])
+        target_item = next(
+            (it for it in snapshot.get("items", []) if it.get("indicator_code") == indicator_code),
+            None,
+        )
+        base_entry = {
+            "sample_id": row["sample_id"],
+            "sampled_at": row["sampled_at"],
+            "report_id": row["report_id"],
+            "reading_version": snapshot.get("reading_version"),
+        }
+        if target_item is None:
+            # 报告快照未含目标指标：不可评估，不参与前后合格计数
+            not_evaluable.append({**base_entry, "reason": "indicator_not_in_report"})
+            continue
+
+        evaluable += 1
+        original_conclusion = snapshot.get("conclusion")
+        if original_conclusion == "qualified":
+            original_qualified += 1
+
+        # 目标指标用拟议限值重判；其他指标沿用原快照的判定/违规原因
+        value = target_item.get("value")
+        new_reasons = _evaluate_value(value, min_value, max_value)
+        other_violations = [
+            v for v in snapshot.get("violations", []) if v.get("indicator_code") != indicator_code
+        ]
+        target_violates = bool(new_reasons)
+        simulated_conclusion = (
+            "unqualified" if (target_violates or other_violations) else "qualified"
+        )
+        if simulated_conclusion == "qualified":
+            simulated_qualified += 1
+
+        if simulated_conclusion != original_conclusion:
+            changed_samples.append(
+                {
+                    **base_entry,
+                    "indicator_code": indicator_code,
+                    "frozen_value": value,
+                    "original_conclusion": original_conclusion,
+                    "simulated_conclusion": simulated_conclusion,
+                    "target_indicator": {
+                        "in_range_original": target_item.get("in_range"),
+                        "in_range_simulated": not target_violates,
+                        "simulated_violations": new_reasons,
+                    },
+                }
+            )
+
+    return {
+        "partition_code": partition_code,
+        "indicator_code": indicator_code,
+        "start_at": timeutil.iso_z(start_utc),
+        "end_at": timeutil.iso_z(end_utc),
+        "proposed_limit": {"min_value": min_value, "max_value": max_value},
+        "evaluable_samples": evaluable,
+        "not_evaluable_samples": not_evaluable,
+        "original_qualified_count": original_qualified,
+        "original_unqualified_count": evaluable - original_qualified,
+        "simulated_qualified_count": simulated_qualified,
+        "simulated_unqualified_count": evaluable - simulated_qualified,
+        "changed_samples": changed_samples,
+    }

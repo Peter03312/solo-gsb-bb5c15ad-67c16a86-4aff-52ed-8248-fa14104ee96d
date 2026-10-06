@@ -7,6 +7,9 @@ Python 3.11 + FastAPI + SQLite 实现。维护各供水分区的**必测指标**
 结论快照；同一读数版本不得重复发布，更正后再发布产生**新版本报告**且旧版保留可查；
 发布事务化，并发发布只准一个成功、失败不留部分报告；并可按分区与采样时间范围
 （左闭右开、仅取每个样本最新已发布报告）查询合格/不合格与按指标的超限汇总。
+质控人员调整限值前，还可在采样时间窗口内以**拟议非负上下限只读重判**目标指标，
+基于已发布报告的冻结读数与其他指标原判定模拟结论变化（不读当前读数、不改限值
+与历史报告；快照未含目标指标的报告列为不可评估）。
 
 ---
 
@@ -121,6 +124,7 @@ Compose 中通过 `ports: "8080:8080"` 映射宿主机端口；改为如 `"18080
 | GET | `/samples/{sample}/reports` | 报告版本列表 |
 | GET | `/samples/{sample}/reports/{report_id}` | 报告快照（读数+限值依据+结论） |
 | GET | `/partitions/{partition}/compliance-summary` | **按分区 + 采样时间窗口汇总**，见下 |
+| POST | `/partitions/{partition}/limit-change-preview` | **限值调整影响预览（只读模拟）**，见下 |
 
 读数请求体：
 
@@ -229,17 +233,114 @@ curl -sS --get "http://localhost:8080/partitions/P1/compliance-summary" \
 }
 ```
 
+### 限值调整影响预览（只读模拟，不改动任何数据）
+
+`POST /partitions/{partition}/limit-change-preview`
+
+质控人员正式调整某指标限值前，按采样时间窗口预演结论影响。服务端**只读取已发布
+报告的冻结快照**，不读取样本当前读数，不修改限值、历史报告或任何主数据。
+
+请求体：
+
+```json
+{
+  "indicator_code": "turbidity",
+  "start_at": "2025-06-01T00:00:00Z",
+  "end_at":   "2025-07-01T00:00:00Z",
+  "min_value": null,
+  "max_value": 0.5
+}
+```
+
+- 窗口 `[start_at, end_at)` **左闭右开**，时间**必须带时区**（服务端归一化 UTC）；
+  `start_at >= end_at` -> `422 invalid_time_range`，不带时区/缺字段 -> `422 validation_error`。
+- `min_value` / `max_value` 为**拟议非负上下限**，均须为有限非负数；可只给一个界，
+  至少给一个（都不给 -> `422 invalid_limit`）；双界时必须 `min_value < max_value`
+  （`422 invalid_limit`）。判定语义与正式限值一致：**下限包含、上限不包含**
+  （`min <= value < max`）。
+- 分区不存在 -> `404 partition_not_found`；指标不存在 -> `404 indicator_not_found`；
+  指标不是该分区必测项 -> `422 not_mandatory_indicator`。
+
+模拟规则：
+
+1. 窗口内**每个样本只取其最新一条已发布报告**的冻结读数与原结论
+   （`reading_version` 最大者；未发布样本不出现）。
+2. 报告快照**未包含目标指标项**（如该指标在报告发布之后才成为必测项）-> 列入
+   `not_evaluable_samples`（带样本标识、采样时刻、报告 id/版本与原因
+   `indicator_not_in_report`），**不参与前后合格数**。
+3. 对可评估报告，目标指标用**拟议限值**重判，其他指标**沿用原快照判定**；
+   合成 `simulated_conclusion`（任一指标违规即 `unqualified`）。
+4. 返回可评估样本数、不可评估样本标识、原/模拟合格数（同时给对应不合格数），
+   以及结论发生变化样本的标识与前后结论（附冻结读数、目标指标前后是否在范围内
+   与模拟违规原因）。窗口内无已发布样本时，计数全为 0、列表为空。
+
+```bash
+curl -sS -X POST "http://localhost:8080/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"turbidity",
+       "start_at":"2025-06-01T00:00:00Z","end_at":"2025-07-01T00:00:00Z",
+       "max_value":0.5}'
+```
+
+```json
+{
+  "partition_code": "P1",
+  "indicator_code": "turbidity",
+  "start_at": "2025-06-01T00:00:00Z",
+  "end_at": "2025-07-01T00:00:00Z",
+  "proposed_limit": {"min_value": null, "max_value": 0.5},
+  "evaluable_samples": 2,
+  "not_evaluable_samples": [],
+  "original_qualified_count": 2,
+  "original_unqualified_count": 0,
+  "simulated_qualified_count": 1,
+  "simulated_unqualified_count": 1,
+  "changed_samples": [
+    {
+      "sample_id": "…",
+      "sampled_at": "2025-06-01T00:00:00Z",
+      "report_id": 12,
+      "reading_version": 3,
+      "indicator_code": "turbidity",
+      "frozen_value": 0.8,
+      "original_conclusion": "qualified",
+      "simulated_conclusion": "unqualified",
+      "target_indicator": {
+        "in_range_original": true,
+        "in_range_simulated": false,
+        "simulated_violations": ["value 0.8 >= max limit 0.5 (max is exclusive)"]
+      }
+    }
+  ]
+}
+```
+
+不可评估列表示例（指标在报告发布后才加入必测项）：
+
+```json
+"not_evaluable_samples": [
+  {
+    "sample_id": "…",
+    "sampled_at": "2025-06-01T00:00:00Z",
+    "report_id": 7,
+    "reading_version": 1,
+    "reason": "indicator_not_in_report"
+  }
+]
+```
+
 ## 5. 调用示例
 
 服务启动后任选其一：
 
 ```bash
 # curl 版（仅依赖 bash/curl/python3 解析 JSON），覆盖全部正常与拒绝路径；
-# 末尾第 11 步演示合规汇总（窗口查询/时区参数/零基线/非法区间/分区不存在）
+# 第 11 步演示合规汇总；第 12 步演示限值调整影响预览
+# （放宽/收紧翻转、不可评估、非法限值/时间窗/必测项等拒绝路径）
 bash examples/api_examples.sh
 
 # Python 版（仅标准库，自带断言，无需安装第三方包）；
-# 末尾演示合规汇总的正常路径、仅最新报告计入与三类错误
+# 末尾演示合规汇总与限值调整预览的正常路径、不可评估与各类拒绝
 python examples/demo_client.py
 
 # 指定地址
@@ -253,11 +354,15 @@ pip install pytest httpx
 pytest -q
 ```
 
-28 个用例覆盖：区间重叠/相接/非法区间、必测成员约束、非负校验、版本冲突、
+41 个用例覆盖：区间重叠/相接/非法区间、必测成员约束、非负校验、版本冲突、
 更正请求号缺失/重放/同号异内容、读数不齐、无生效限值、左闭右开边界、
 min 闭/max 开判定、重复发布、更正后新旧版本并存、5 线程并发发布仅一个成功、
 发布失败不留报告；以及合规汇总的零基线、仅最新报告计入、未发布排除、
-左闭右开窗口与时区归一、分区间隔离、按指标超限计数、非法区间/缺分区错误。
+左闭右开窗口与时区归一、分区间隔离、按指标超限计数、非法区间/缺分区错误；
+限值调整预览的零计数空列表、放宽/收紧翻转、其他指标原违规阻断翻转、
+上限开端/下限包含边界、仅取最新冻结快照（忽略未发布的当前读数）、
+不可评估样本、单界/双界与零界、左闭右开窗口与时区归一、未发布排除，
+以及分区/指标不存在、非必测、时间窗、限值、无时区、负值/非有限值等拒绝路径。
 
 ## 7. 项目结构
 
@@ -274,6 +379,7 @@ app/
   routers/admin.py     # 主数据管理接口
   routers/samples.py   # 样本/读数/发布接口
   routers/summaries.py # 合规汇总查询接口（分区 + 采样时间窗口）
+  routers/previews.py  # 限值调整影响预览接口（只读模拟，不改任何数据）
 scripts/init_db.py     # 手工初始化脚本
 examples/              # curl 与 Python 调用示例
 tests/                 # pytest 端到端用例
@@ -298,3 +404,9 @@ requirements.txt
   再按 `sampled_at_ms >= start AND sampled_at_ms < end` 左闭右开过滤，
   快照 `violations` 在应用层聚合按指标计数；汇总走只读事务快照，
   未发布样本（reports 中无行）自然被 JOIN 排除。
+- **限值调整预览**：纯只读 `read_tx`，复用与汇总相同的“每样本最新已发布报告”
+  关联子查询；模拟只基于报告 `snapshot_json` 中冻结的 items/violations——目标指标
+  项以拟议界用同一套 `min 闭/max 开` 规则重判，其他指标沿用快照原判定，
+  **从不读取 readings 当前值，也不触碰 limits/reports**。快照缺目标指标项即标记
+  `indicator_not_in_report` 并排除在前后合格数之外；校验顺序为时间窗 → 限值界 →
+  分区/指标/必测成员，全部错误走统一错误信封。

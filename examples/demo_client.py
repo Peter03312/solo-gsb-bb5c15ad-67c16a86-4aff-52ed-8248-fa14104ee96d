@@ -5,7 +5,9 @@
   登记样本 -> 录入读数 -> 版本冲突 -> 更正(请求号/重放/同号异内容)
   -> 首次发布(不合格快照) -> 重复发布拒绝 -> 更正后再发布(新版本合格, 旧版可查)
   -> 读数不齐/无生效限值门禁
-  -> 按分区 + 采样时刻窗口的合规汇总（左闭右开、仅最新已发布报告、按指标超限次数）。
+  -> 按分区 + 采样时刻窗口的合规汇总（左闭右开、仅最新已发布报告、按指标超限次数）
+  -> 限值调整影响预览（拟议非负上下限只读重判目标指标、合成模拟结论、
+     不可评估样本、前后合格数与结论变化清单）。
 
 用法：
     python examples/demo_client.py            # 默认 http://localhost:8080
@@ -248,7 +250,7 @@ def main() -> None:
     step("仅最新已发布报告计入：更正 ph 并重新发布为合格 -> 汇总变为 2 份全部合格")
     s, corr = call("PUT", f"/samples/{sid_bad}/readings/ph",
                    {"indicator_code": "ph", "value": 7.0,
-                    "expected_version": 3, "request_no": f"DEMO-FIX-{anchor.strftime('%H%M%S')}"})
+                    "expected_version": 3, "request_no": f"DEMO-FIX-{RUN_TAG}"})
     expect(200, s, "correction")
     s, _ = call("POST", f"/samples/{sid_bad}/publish",
                 {"expected_version": corr["reading_version"]})
@@ -286,6 +288,125 @@ def main() -> None:
 
     step("汇总错误：分区不存在 -> 404 partition_not_found")
     s, r = call("GET", f"/partitions/NOPE/compliance-summary?{qs}")
+    expect(404, s, "partition missing")
+    print("  code:", r["error"]["code"])
+
+    # -------------------------------------------------- 限值调整影响预览
+    step("限值预览准备：本次运行专用分区（仅 conductivity 必测，2020-2030 相接限值）")
+    s, r = call("POST", "/admin/indicators",
+                {"code": "conductivity", "name": "电导率", "unit": "uS/cm"})
+    assert s in (201, 409), (s, r)
+    pv_partition = "P" + datetime.now(timezone.utc).strftime("%H%M%S%f")[:12]
+    s, r = call("POST", "/admin/partitions",
+                {"code": pv_partition, "name": "预览演示分区"})
+    assert s == 201, (s, r)
+    s, r = call("POST", f"/admin/partitions/{pv_partition}/mandatory-indicators",
+                {"indicator_code": "conductivity"})
+    assert s == 201, (s, r)
+    for vfrom, vto in [
+        ("2020-01-01T00:00:00Z", "2025-01-01T00:00:00Z"),
+        ("2025-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+        ("2026-01-01T00:00:00Z", "2030-01-01T00:00:00Z"),
+    ]:
+        s, r = call("POST", f"/admin/partitions/{pv_partition}/limits",
+                    {"indicator_code": "conductivity", "max_value": 300.0,
+                     "valid_from": vfrom, "valid_to": vto})
+        assert s == 201, (s, r)
+    # 在 2020 年取一个本次运行专属的 10 分钟窗口（落在 conductivity 限值生效区间内）。
+    pv_anchor = datetime(2020, 1, 1, tzinfo=timezone.utc) + timedelta(
+        minutes=int(pv_partition[1:]) % 50000 * 10)
+    pv_end = pv_anchor + timedelta(minutes=10)
+
+    def register_conductivity(offset_min: int, value: float) -> str:
+        s, sample = call("POST", "/samples",
+                         {"partition_code": pv_partition,
+                          "sampled_at": iso(pv_anchor + timedelta(minutes=offset_min))})
+        assert s == 201, (s, sample)
+        s2, _ = call("PUT", f"/samples/{sample['id']}/readings/conductivity",
+                     {"indicator_code": "conductivity", "value": value,
+                      "expected_version": 0,
+                      "request_no": f"PV-{RUN_TAG}-{offset_min}"})
+        assert s2 == 200, (s2, _)
+        s3, _ = call("POST", f"/samples/{sample['id']}/publish",
+                     {"expected_version": 1})
+        assert s3 == 201, (s3, _)
+        return sample["id"]
+
+    sid_350 = register_conductivity(2, 350.0)   # 原 <300 上限下不合格
+    sid_200 = register_conductivity(4, 200.0)   # 合格
+
+    def preview(max_value=None, min_value=None, partition=None,
+                indicator="conductivity", start=None, end=None):
+        body = {"indicator_code": indicator,
+                "start_at": iso(start or pv_anchor), "end_at": iso(end or pv_end)}
+        if max_value is not None:
+            body["max_value"] = max_value
+        if min_value is not None:
+            body["min_value"] = min_value
+        return call("POST", f"/partitions/{partition or pv_partition}/limit-change-preview",
+                    body)
+
+    step("预览放宽上限 <400：原合格1/不合格1 -> 模拟合格2，350 样本结论翻转")
+    s, pv = preview(max_value=400.0)
+    expect(200, s, "preview relax")
+    print(" ", json.dumps(pv, ensure_ascii=False))
+    assert pv["evaluable_samples"] == 2
+    assert pv["not_evaluable_samples"] == []
+    assert pv["original_qualified_count"] == 1 and pv["original_unqualified_count"] == 1
+    assert pv["simulated_qualified_count"] == 2 and pv["simulated_unqualified_count"] == 0
+    flip = {(c["sample_id"], c["original_conclusion"], c["simulated_conclusion"])
+            for c in pv["changed_samples"]}
+    assert flip == {(sid_350, "unqualified", "qualified")}
+
+    step("预览收紧上限 <150：两份全部变不合格（上限开端；350 本就不合格，仅 200 翻转）")
+    s, pv = preview(max_value=150.0)
+    expect(200, s, "preview tighten")
+    assert pv["simulated_qualified_count"] == 0 and pv["simulated_unqualified_count"] == 2
+    assert {c["sample_id"] for c in pv["changed_samples"]} == {sid_200}
+    print("  changed:", [(c["sample_id"][:8], c["original_conclusion"],
+                          c["simulated_conclusion"]) for c in pv["changed_samples"]])
+
+    step("仅拟议下限（>=100，下限包含、不设上限）：200 保持合格；350 因上限被撤销量不合格")
+    s, pv = preview(min_value=100.0)
+    expect(200, s, "preview lower only")
+    assert pv["proposed_limit"] == {"min_value": 100.0, "max_value": None}
+    assert pv["simulated_qualified_count"] == 2
+    assert {c["sample_id"] for c in pv["changed_samples"]} == {sid_350}
+
+    step("不可评估：发布后新增必测指标 hardness，历史快照不含该项")
+    s, _ = call("POST", "/admin/indicators",
+                {"code": "hardness", "name": "总硬度", "unit": "mg/L"})
+    assert s in (201, 409)
+    s, _ = call("POST", f"/admin/partitions/{pv_partition}/mandatory-indicators",
+                {"indicator_code": "hardness"})
+    assert s in (201, 409)
+    s, pv = preview(indicator="hardness", max_value=450.0)
+    expect(200, s, "preview not evaluable")
+    assert pv["evaluable_samples"] == 0
+    assert len(pv["not_evaluable_samples"]) == 2
+    assert {n["sample_id"] for n in pv["not_evaluable_samples"]} == {sid_350, sid_200}
+    assert all(n["reason"] == "indicator_not_in_report" for n in pv["not_evaluable_samples"])
+    assert pv["original_qualified_count"] == 0 and pv["simulated_qualified_count"] == 0
+    assert pv["changed_samples"] == []
+
+    step("预览拒绝：双界 min>=max / 窗口非法 / 非必测 / 指标不存在 / 分区不存在")
+    s, r = preview(min_value=400.0, max_value=400.0)
+    expect(422, s, "min >= max")
+    print("  code:", r["error"]["code"])
+    s, r = preview(start=pv_end, end=pv_anchor)
+    expect(422, s, "invalid window")
+    print("  code:", r["error"]["code"])
+    s, r = call("POST", "/partitions/P1/limit-change-preview",
+                {"indicator_code": "conductivity",
+                 "start_at": iso(pv_anchor), "end_at": iso(pv_end), "max_value": 400.0})
+    expect(422, s, "not mandatory")
+    print("  code:", r["error"]["code"])
+    s, r = preview(indicator="nope_indicator", max_value=1.0)
+    expect(404, s, "indicator missing")
+    print("  code:", r["error"]["code"])
+    s, r = call("POST", "/partitions/NOPE/limit-change-preview",
+                {"indicator_code": "conductivity",
+                 "start_at": iso(pv_anchor), "end_at": iso(pv_end), "max_value": 400.0})
     expect(404, s, "partition missing")
     print("  code:", r["error"]["code"])
 

@@ -151,5 +151,84 @@ curl -sS -w '\nHTTP %{http_code}\n' --get "$BASE/partitions/NOPE/compliance-summ
   --data-urlencode "start_at=2025-01-01T00:00:00Z" \
   --data-urlencode "end_at=2026-01-01T00:00:00Z"
 
+say "12. 限值调整影响预览（只读模拟，不改限值/报告，不读当前读数）"
+# 每次运行使用独立分区（分区码含纳秒时间戳），重跑脚本互不干扰；
+# conductivity 指标已在第 2 节创建，这里为新分区挂必测关系与一段宽时限值。
+PV_P="PVP$(date -u +%H%M%S%N | head -c 15)"
+curl -sS -o /dev/null -X POST "$BASE/admin/partitions" -H 'Content-Type: application/json' \
+  -d "{\"code\":\"$PV_P\",\"name\":\"限值预览演示分区\"}"
+curl -sS -o /dev/null -X POST "$BASE/admin/partitions/$PV_P/mandatory-indicators" \
+  -H 'Content-Type: application/json' -d '{"indicator_code":"conductivity"}'
+curl -sS -o /dev/null -X POST "$BASE/admin/partitions/$PV_P/limits" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"conductivity","max_value":300.0,
+       "valid_from":"2000-01-01T00:00:00Z","valid_to":"2100-01-01T00:00:00Z"}'
+# 以当前 UTC 时刻锚定本次运行窗口（左闭右开，10 分钟）
+PV_ANCHOR=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+PV_T1=$(date -u -d "$PV_ANCHOR +2 minutes" +%Y-%m-%dT%H:%M:%SZ)
+PV_T2=$(date -u -d "$PV_ANCHOR +4 minutes" +%Y-%m-%dT%H:%M:%SZ)
+PV_END=$(date -u -d "$PV_ANCHOR +10 minutes" +%Y-%m-%dT%H:%M:%SZ)
+PV_REQ="pv-demo-$(date -u +%s%N)"
+PV_S1=$(curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' \
+  -d "{\"partition_code\":\"$PV_P\",\"sampled_at\":\"$PV_T1\"}" | jqget "['id']")
+curl -sS -X PUT "$BASE/samples/$PV_S1/readings/conductivity" -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"value\":350,\"expected_version\":0,\"request_no\":\"$PV_REQ-1\"}" \
+  | python3 -m json.tool
+curl -sS -o /dev/null -X POST "$BASE/samples/$PV_S1/publish" -H 'Content-Type: application/json' \
+  -d '{"expected_version":1}'
+PV_S2=$(curl -sS -X POST "$BASE/samples" -H 'Content-Type: application/json' \
+  -d "{\"partition_code\":\"$PV_P\",\"sampled_at\":\"$PV_T2\"}" | jqget "['id']")
+curl -sS -o /dev/null -X PUT "$BASE/samples/$PV_S2/readings/conductivity" -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"value\":200,\"expected_version\":0,\"request_no\":\"$PV_REQ-2\"}"
+curl -sS -o /dev/null -X POST "$BASE/samples/$PV_S2/publish" -H 'Content-Type: application/json' \
+  -d '{"expected_version":1}'
+echo "  分区 $PV_P；样本 $PV_S1 冻结读数 350（原 <300 上限下不合格）；$PV_S2 冻结读数 200（合格）"
+
+say "12b. 拟议放宽上限到 <400：350 翻转合格，200 保持合格；原合格1 -> 模拟合格2"
+curl -sS -X POST "$BASE/partitions/$PV_P/limit-change-preview" -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"start_at\":\"$PV_ANCHOR\",\"end_at\":\"$PV_END\",\"max_value\":400.0}" \
+  | python3 -m json.tool
+
+say "12c. 拟议收紧上限到 <150（仅上限、上限开端）：200 翻转不合格（350 本就不合格）"
+curl -sS -X POST "$BASE/partitions/$PV_P/limit-change-preview" -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"start_at\":\"$PV_ANCHOR\",\"end_at\":\"$PV_END\",\"max_value\":150.0}" \
+  | python3 -m json.tool
+
+say "12d. 报告未含目标指标 -> 不可评估，不参与前后合格数"
+echo "  新建指标 hardness 并把它加为本分区必测项（在上面两份 conductivity 报告发布之后）："
+curl -sS -o /dev/null -X POST "$BASE/admin/indicators" -H 'Content-Type: application/json' \
+  -d '{"code":"hardness","name":"总硬度","unit":"mg/L"}'
+curl -sS -o /dev/null -X POST "$BASE/admin/partitions/$PV_P/mandatory-indicators" \
+  -H 'Content-Type: application/json' -d '{"indicator_code":"hardness"}'
+echo "  预览 hardness：两份已发布快照均不含该项 -> evaluable=0 + not_evaluable 两条"
+curl -sS -X POST "$BASE/partitions/$PV_P/limit-change-preview" -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"hardness\",\"start_at\":\"$PV_ANCHOR\",\"end_at\":\"$PV_END\",\"max_value\":450.0}" \
+  | python3 -m json.tool
+
+say "12e. 拒绝路径：双界下界>=上界 422 invalid_limit"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/$PV_P/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"start_at\":\"$PV_ANCHOR\",\"end_at\":\"$PV_END\",
+       \"min_value\":400,\"max_value\":400}"
+
+say "12f. 拒绝路径：时间窗非法 / 不带时区"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/$PV_P/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"start_at\":\"$PV_END\",\"end_at\":\"$PV_ANCHOR\",\"max_value\":400}"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/$PV_P/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"start_at\":\"2025-06-01T08:00:00\",\"end_at\":\"$PV_END\",\"max_value\":400}"
+
+say "12g. 拒绝路径：指标非分区必测项 422 / 指标不存在 404 / 分区不存在 404"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/P1/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"indicator_code":"conductivity","start_at":"2025-01-01T00:00:00Z","end_at":"2026-01-01T00:00:00Z","max_value":400}'
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/$PV_P/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"nope\",\"start_at\":\"$PV_ANCHOR\",\"end_at\":\"$PV_END\",\"max_value\":400}"
+curl -sS -w '\nHTTP %{http_code}\n' -X POST "$BASE/partitions/NOPE/limit-change-preview" \
+  -H 'Content-Type: application/json' \
+  -d "{\"indicator_code\":\"conductivity\",\"start_at\":\"$PV_ANCHOR\",\"end_at\":\"$PV_END\",\"max_value\":400}"
+
 echo
 echo "DONE. 可交互式查看 OpenAPI 文档： $BASE/docs"
